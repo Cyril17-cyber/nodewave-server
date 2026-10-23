@@ -119,14 +119,20 @@ describe("password reset", () => {
 });
 
 describe("sessions", () => {
-  it("rotates refresh tokens and revokes everything when an old one is reused", async () => {
+  it("rotates refresh tokens and revokes that login's tokens when an old one is reused", async () => {
     const user = await createUser();
+    const otherDevice = await api()
+      .post("/v1/auth/login")
+      .send({ email: user.email, password: user.password })
+      .expect(200);
     const first = await api().post("/v1/auth/refresh").send({ refreshToken: user.refreshToken }).expect(200);
     assert.notEqual(first.body.refreshToken, user.refreshToken);
 
-    // Replaying the original token looks like theft: every session is revoked
+    // Replaying the original token looks like theft: every token from that login is revoked
     await api().post("/v1/auth/refresh").send({ refreshToken: user.refreshToken }).expect(401);
     await api().post("/v1/auth/refresh").send({ refreshToken: first.body.refreshToken }).expect(401);
+    // ...but the user's other logins keep working
+    await api().post("/v1/auth/refresh").send({ refreshToken: otherDevice.body.refreshToken }).expect(200);
   });
 
   it("logs out a refresh token", async () => {

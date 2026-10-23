@@ -10,11 +10,14 @@ export async function listReleases({ limit = 30, offset = 0, type = null, artist
   const { rows } = await pool.query(
     `SELECT p.id, p.playlist_type, p.cover, p.title, p.genre, p.record_label, p.created_at,
             u.id AS artiste_id, u.name AS artiste_name, u.display_picture_url AS artiste_picture,
-            stats.track_count, stats.min_price_wei, stats.release_year
+            stats.track_count, stats.min_price_wei, stats.release_year, stats.duration_seconds
      FROM playlist p
      JOIN users u ON u.id = p.artiste_id
      CROSS JOIN LATERAL (
-       SELECT count(*)::int AS track_count, min(m.price_wei) AS min_price_wei, min(m.release_year) AS release_year
+       SELECT count(*)::int AS track_count, min(m.price_wei) AS min_price_wei, min(m.release_year) AS release_year,
+              -- song_duration is stored as "m:ss"; anything else is left out of the total
+              sum(split_part(m.song_duration, ':', 1)::int * 60 + split_part(m.song_duration, ':', 2)::int)
+                FILTER (WHERE m.song_duration ~ '^[0-9]+:[0-5][0-9]$')::int AS duration_seconds
        FROM music m WHERE m.album_id = p.id
      ) stats
      WHERE ($3::text IS NULL OR p.playlist_type = $3) AND ($4::int IS NULL OR p.artiste_id = $4)

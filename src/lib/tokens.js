@@ -30,29 +30,33 @@ export function verifyAccessToken(token) {
   }
 }
 
-async function createRefreshToken(db, userId) {
+async function createRefreshToken(db, userId, familyId) {
   const token = crypto.randomBytes(32).toString("base64url");
   await db.query(
-    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-     VALUES ($1, $2, now() + make_interval(days => $3))`,
-    [userId, sha256(token), config.REFRESH_TOKEN_TTL_DAYS]
+    `INSERT INTO refresh_tokens (user_id, token_hash, family_id, expires_at)
+     VALUES ($1, $2, $3, now() + make_interval(days => $4))`,
+    [userId, sha256(token), familyId, config.REFRESH_TOKEN_TTL_DAYS]
   );
   return token;
 }
 
-/** The session payload every login/refresh endpoint returns. */
-export async function issueSession(userId, db = pool) {
+/**
+ * The session payload every login/refresh endpoint returns. A login starts a new token
+ * family; a refresh passes the family of the token it rotates.
+ */
+export async function issueSession(userId, db = pool, familyId = crypto.randomUUID()) {
   return {
     accessToken: signAccessToken(userId),
     accessTokenExpiresAt: Date.now() + config.ACCESS_TOKEN_TTL_SECONDS * 1000,
-    refreshToken: await createRefreshToken(db, userId),
+    refreshToken: await createRefreshToken(db, userId, familyId),
   };
 }
 
 /**
  * Exchanges a refresh token for a new session (rotation). A token that was already rotated
  * is accepted again only within a short grace window (concurrent refreshes from two tabs);
- * after that, presenting it means it was stolen, so every session for that user is revoked.
+ * after that, presenting it means it was stolen or replayed, so that login's whole token
+ * family is revoked. The user's other devices stay signed in.
  */
 export async function rotateRefreshToken(token) {
   const result = await withTransaction(async (client) => {
@@ -64,13 +68,16 @@ export async function rotateRefreshToken(token) {
     if (!row || row.revoked_at) return { error: "INVALID" };
     if (row.expires_at < new Date()) return { error: "EXPIRED" };
     if (row.rotated_at) {
-      if (row.in_grace) return { userId: row.user_id, session: await issueSession(row.user_id, client) };
-      await revokeAllSessions(row.user_id, client);
+      if (row.in_grace) return { userId: row.user_id, session: await issueSession(row.user_id, client, row.family_id) };
+      await client.query(
+        "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
+        [row.family_id]
+      );
       return { error: "REUSED" };
     }
 
     await client.query("UPDATE refresh_tokens SET rotated_at = now() WHERE id = $1", [row.id]);
-    return { userId: row.user_id, session: await issueSession(row.user_id, client) };
+    return { userId: row.user_id, session: await issueSession(row.user_id, client, row.family_id) };
   });
   // Thrown outside the transaction so the reuse revocation is committed
   if (result.error) throw unauthorized("Invalid refresh token", "INVALID_REFRESH_TOKEN");

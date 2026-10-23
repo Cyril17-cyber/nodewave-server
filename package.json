@@ -8,7 +8,8 @@
     "dev": "node --watch src/server.js",
     "migrate": "node src/db/migrate.js",
     "sync-abi": "node scripts/sync-abi.js",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "reset-chain": "node scripts/reset-chain-data.js"
   },
   "type": "module",
   "author": "Cyril Asogwa",
