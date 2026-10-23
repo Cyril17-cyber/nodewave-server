@@ -15,6 +15,10 @@ export function errorHandler(err, req, res, _next) {
     const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
     return res.status(status).json({ message: err.message, code: err.code });
   }
+  // http-errors from Express itself (e.g. express.static 404s, range errors)
+  if (err.expose && err.status >= 400 && err.status < 500) {
+    return res.status(err.status).json({ message: err.message, code: err.status === 404 ? "NOT_FOUND" : "BAD_REQUEST" });
+  }
   if (err.code === "23505") {
     // Postgres unique violation, e.g. two requests racing to create the same row
     return res.status(409).json({ message: "That already exists.", code: "CONFLICT" });

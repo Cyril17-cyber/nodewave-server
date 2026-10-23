@@ -17,15 +17,15 @@ function stubFetch(routes) {
 }
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
-async function seedRelease(artisteId) {
+async function seedRelease(artisteId, { album = "Album 100%", song = "Song_One" } = {}) {
   const { rows: [playlist] } = await pool.query(
-    "INSERT INTO playlist (playlist_type, cover, title, genre, artiste_id) VALUES ('Album', 'https://x/cover', 'Album 100%', 'Afrobeats', $1) RETURNING *",
-    [artisteId]
+    "INSERT INTO playlist (playlist_type, cover, title, genre, artiste_id) VALUES ('Album', 'https://x/cover', $2, 'Afrobeats', $1) RETURNING *",
+    [artisteId, album]
   );
   const { rows: [track] } = await pool.query(
     `INSERT INTO music (title, writers, producers, price, price_wei, token_id, artiste_id, album_id)
-     VALUES ('Song_One', 'W', 'P', '0.01', 10000000000000000, (SELECT coalesce(max(token_id), 0) + 1 FROM music), $1, $2) RETURNING *`,
-    [artisteId, playlist.id]
+     VALUES ($3, 'W', 'P', '0.01', 10000000000000000, (SELECT coalesce(max(token_id), 0) + 1 FROM music), $1, $2) RETURNING *`,
+    [artisteId, playlist.id, song]
   );
   return { playlist, track };
 }
@@ -243,7 +243,7 @@ describe("catalogue", () => {
     assert.equal(listed.track_count, 1);
     assert.equal(listed.min_price, "0.01");
 
-    await seedRelease(artiste.user.id);
+    await seedRelease(artiste.user.id, { album: "Second Release", song: "Other Song" });
     const firstPage = await api().get("/v1/playlists").query({ limit: 1 }).expect(200);
     assert.equal(firstPage.body.playlists.length, 1);
     assert.equal(firstPage.body.nextOffset, 1);

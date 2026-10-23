@@ -1,6 +1,6 @@
 // End-to-end against a local Hardhat node: `npx hardhat node` in ../eth-server.
 // Skipped when no node is reachable.
-import { setup } from "./helpers.js";
+import { apiPath, makeTone, setup } from "./helpers.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { after, before, describe, it } from "node:test";
@@ -25,8 +25,11 @@ describe("on-chain flows", { skip: chainId ? false : `no Ethereum node at ${RPC}
   let ctx, publicClient, wallet, address, accounts, syncOnce;
 
   const write = async (account, functionName, args, value) => {
-    const hash = await wallet(account).writeContract({ address, abi, functionName, args, value });
-    await publicClient.waitForTransactionReceipt({ hash });
+    // Simulate first so a revert fails the test with the contract error instead of passing silently
+    const { request } = await publicClient.simulateContract({ account, address, abi, functionName, args, value });
+    const hash = await wallet(account).writeContract(request);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    assert.equal(receipt.status, "success", `${functionName} reverted`);
     return hash;
   };
 
@@ -51,14 +54,35 @@ describe("on-chain flows", { skip: chainId ? false : `no Ethereum node at ${RPC}
     return { message, signature, res: await ctx.api().post("/v1/wallets").set(user.auth).send({ message, signature }) };
   }
 
-  const releaseBody = (txHash, count, type = "Album") => ({
+  const releaseBody = (txHash, uploads, type = "Album") => ({
     txHash,
     type,
     title: "Debut",
     genre: "Afrobeats",
     cover: "https://test.mypinata.cloud/ipfs/cover",
-    tracks: Array.from({ length: count }, (_, i) => ({ title: `Track ${i + 1}`, writers: "W", producers: "P" })),
+    tracks: uploads.map((u, i) => ({ title: `Track ${i + 1}`, writers: "W", producers: "P", audioId: u.audioId })),
   });
+
+  let toneFrequency = 200;
+  /** Uploads `count` distinct tracks; returns [{ audioId, uri, previewUrl }]. */
+  async function uploadTracks(user, count) {
+    const uploads = [];
+    for (let i = 0; i < count; i++) {
+      const res = await ctx
+        .api()
+        .post("/v1/uploads/track")
+        .set(user.auth)
+        .field("title", `Track ${i + 1}`)
+        .field("coverUri", "https://test.mypinata.cloud/ipfs/cover")
+        .attach("file", makeTone({ seconds: 6, frequency: (toneFrequency += 37) }), {
+          filename: "t.mp3",
+          contentType: "audio/mpeg",
+        })
+        .expect(201);
+      uploads.push(res.body);
+    }
+    return uploads;
+  }
 
   before(async () => {
     const chain = defineChain({
@@ -79,6 +103,7 @@ describe("on-chain flows", { skip: chainId ? false : `no Ethereum node at ${RPC}
     process.env.CONTRACT_ADDRESS = address;
     process.env.INDEXER_START_BLOCK = String(receipt.blockNumber);
     process.env.INDEXER_CONFIRMATIONS = "1";
+    process.env.PINATA_JWT = "";
     ctx = await setup();
     ({ syncOnce } = await import("../src/indexer/indexer.js"));
   });
@@ -109,67 +134,130 @@ describe("on-chain flows", { skip: chainId ? false : `no Ethereum node at ${RPC}
     });
   });
 
-  describe("releases and indexing", () => {
-    let artist, buyer, release;
-    const [artistUris, prices] = [["ipfs://song-a", "ipfs://song-b"], [parseEther("0.01"), parseEther("0.02")]];
+  describe("releases, resales and trades", () => {
+    let artist, buyer, collector, release, single, albumUploads;
+    const prices = [parseEther("0.01"), parseEther("0.02")];
 
     before(async () => {
       artist = await ctx.createUser();
       buyer = await ctx.createUser();
+      collector = await ctx.createUser();
       assert.equal((await linkWallet(artist, accounts[4])).res.status, 201);
       assert.equal((await linkWallet(buyer, accounts[5])).res.status, 201);
+      assert.equal((await linkWallet(collector, accounts[6])).res.status, 201);
     });
 
-    it("registers a release using token ids and prices from the chain", async () => {
-      const txHash = await mintCollection(accounts[4], artistUris, prices);
-      const res = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, 2)).expect(201);
+    it("mints with the uploaded metadata and registers the release from chain data", async () => {
+      albumUploads = await uploadTracks(artist, 2);
+      // Without Pinata, metadata is served by the API itself and points at the public preview
+      const metadata = await ctx.api().get(apiPath(albumUploads[0].uri)).expect(200);
+      assert.equal(metadata.body.animation_url, albumUploads[0].previewUrl);
+
+      const txHash = await mintCollection(accounts[4], albumUploads.map((u) => u.uri), prices);
+      const res = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, albumUploads)).expect(201);
       release = res.body;
       assert.deepEqual(release.trackList.map((t) => t.price), ["0.01", "0.02"]);
-      const onChainIds = await Promise.all(
-        artistUris.map(async (_, i) => (await publicClient.readContract({ address, abi, functionName: "idMarketItem", args: [BigInt(release.trackList[i].token_id)] }))[1])
-      );
-      assert.deepEqual(onChainIds, artistUris);
+      assert.deepEqual(release.trackList.map((t) => t.gated), [true, true]);
 
-      const again = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, 2)).expect(409);
+      const again = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, albumUploads)).expect(409);
       assert.equal(again.body.code, "ALREADY_REGISTERED");
     });
 
-    it("refuses mints from a wallet the caller hasn't linked, and mismatched descriptions", async () => {
-      const txHash = await mintCollection(accounts[4], ["ipfs://song-c"], [parseEther("0.01")]);
-      const notMine = await ctx.api().post("/v1/playlists").set(buyer.auth).send(releaseBody(txHash, 1, "Single")).expect(403);
+    it("refuses mints from unlinked wallets, wrong track counts, and audio that doesn't match the token", async () => {
+      const uploads = await uploadTracks(artist, 2);
+      const txHash = await mintCollection(accounts[4], [uploads[0].uri], [parseEther("0.01")]);
+
+      const notMine = await ctx.api().post("/v1/playlists").set(buyer.auth).send(releaseBody(txHash, [uploads[0]], "Single")).expect(403);
       assert.equal(notMine.body.code, "WALLET_NOT_LINKED");
-      const mismatch = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, 2, "EP")).expect(400);
-      assert.equal(mismatch.body.code, "TRACK_MISMATCH");
-      await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, 2, "Single")).expect(400);
-      await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, 1, "Single")).expect(201);
+      const count = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, uploads, "EP")).expect(400);
+      assert.equal(count.body.code, "TRACK_MISMATCH");
+      // The token was minted with upload 0's metadata, so upload 1's audio can't be attached to it
+      const swapped = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, [uploads[1]], "Single")).expect(400);
+      assert.equal(swapped.body.code, "AUDIO_MISMATCH");
+
+      const ok = await ctx.api().post("/v1/playlists").set(artist.auth).send(releaseBody(txHash, [uploads[0]], "Single")).expect(201);
+      single = ok.body.trackList[0];
     });
 
-    it("indexes purchases and price changes", async () => {
+    it("indexes purchases and price changes, and unlocks the full track for the buyer", async () => {
       const [first] = release.trackList;
+      await ctx.api().get(`/v1/tracks/${first.id}/stream`).set(buyer.auth).expect(403);
+
       await write(accounts[5], "buyToken", [BigInt(first.token_id), 1n], parseEther("0.01"));
       await write(accounts[4], "updateItemPrice", [BigInt(first.token_id), parseEther("0.05")]);
-
       assert.ok((await syncOnce()) > 0);
       assert.equal(await syncOnce(), 0, "re-running the indexer applies nothing twice");
 
       const me = await ctx.api().get("/v1/me").set(buyer.auth).expect(200);
       assert.deepEqual(me.body.user.purchased_songs, [String(first.id)]);
 
-      const { rows } = await ctx.pool.query("SELECT supply FROM chain_tokens WHERE token_id = $1", [first.token_id]);
-      assert.equal(rows[0].supply, "4");
-
       const playlist = await ctx.api().get(`/v1/playlists/${release.playlist.id}`).set(buyer.auth).expect(200);
       assert.equal(playlist.body.trackList[0].price, "0.05");
-      assert.equal(playlist.body.trackList[0].uri, "ipfs://song-a");
       assert.equal(playlist.body.trackList[0].supply, "4");
-      // Ownership comes from indexed transfers to the buyer's linked wallet
       assert.deepEqual(playlist.body.trackList.map((t) => t.owned), [1, 0]);
 
-      const library = await ctx.api().get("/v1/me/library").set(buyer.auth).expect(200);
-      assert.deepEqual(library.body.tracks.map((t) => t.id), [first.id]);
-      // Artistes keep one copy of every track they mint
+      const stream = await ctx.api().get(`/v1/tracks/${first.id}/stream`).set(buyer.auth).expect(200);
+      await ctx.api().get(apiPath(stream.body.url)).expect(200);
+
       const artistLibrary = await ctx.api().get("/v1/me/library").set(artist.auth).expect(200);
-      assert.equal(artistLibrary.body.tracks.length, 3);
+      assert.equal(artistLibrary.body.tracks.length, 3, "artistes keep a copy of every track they mint");
+    });
+
+    it("lists a copy for resale and sells it to another collector", async () => {
+      const [, second] = release.trackList;
+      // The artiste resells their own copy of track 2
+      await write(accounts[4], "listForResale", [BigInt(second.token_id), 1n, parseEther("0.03")]);
+      await syncOnce();
+
+      const listings = await ctx.api().get(`/v1/tracks/${second.id}/listings`).set(collector.auth).expect(200);
+      assert.equal(listings.body.listings.length, 1);
+      const [listing] = listings.body.listings;
+      assert.equal(listing.price, "0.03");
+      assert.equal(listing.mine, false);
+      const mine = await ctx.api().get("/v1/me/listings").set(artist.auth).expect(200);
+      assert.deepEqual(mine.body.listings.map((l) => l.listing_id), [listing.listing_id]);
+
+      await write(accounts[6], "buyResale", [BigInt(listing.listing_id), 1n], parseEther("0.03"));
+      await syncOnce();
+
+      const after = await ctx.api().get(`/v1/tracks/${second.id}/listings`).expect(200);
+      assert.equal(after.body.listings.length, 0);
+      const library = await ctx.api().get("/v1/me/library").set(collector.auth).expect(200);
+      assert.deepEqual(library.body.tracks.map((t) => t.id), [second.id]);
+      const { rows } = await ctx.pool.query("SELECT kind FROM purchases WHERE token_id = $1", [second.token_id]);
+      assert.deepEqual(rows.map((r) => r.kind), ["resale"]);
+    });
+
+    it("tracks a trade offer from proposal to acceptance", async () => {
+      const [first, second] = release.trackList;
+      const holders = await ctx.api().get(`/v1/tracks/${second.id}/holders`).set(buyer.auth).expect(200);
+      const collectorHolder = holders.body.holders.find((h) => h.user_id === collector.user.id);
+      assert.ok(collectorHolder, "the collector shows up as a holder of track 2");
+
+      // Buyer offers their copy of track 1 for the collector's copy of track 2
+      const tradeFee = await publicClient.readContract({ address, abi, functionName: "tradeFee" });
+      await write(accounts[5], "createTradeOffer", [collectorHolder.address, BigInt(first.token_id), 1n, BigInt(second.token_id), 1n], tradeFee);
+      await syncOnce();
+
+      const incoming = await ctx.api().get("/v1/me/trades").set(collector.auth).expect(200);
+      const [offer] = incoming.body.trades;
+      assert.equal(offer.status, "open");
+      assert.equal(offer.incoming, true);
+      assert.equal(offer.offered_track.id, first.id);
+      assert.equal(offer.requested_track.id, second.id);
+      const outgoing = await ctx.api().get("/v1/me/trades").set(buyer.auth).expect(200);
+      assert.equal(outgoing.body.trades[0].incoming, false);
+
+      await write(accounts[6], "acceptTradeOffer", [BigInt(offer.trade_id)]);
+      await syncOnce();
+
+      const done = await ctx.api().get("/v1/me/trades").set(collector.auth).expect(200);
+      assert.equal(done.body.trades[0].status, "accepted");
+      const buyerLibrary = await ctx.api().get("/v1/me/library").set(buyer.auth).expect(200);
+      assert.deepEqual(buyerLibrary.body.tracks.map((t) => t.id), [second.id]);
+      const collectorLibrary = await ctx.api().get("/v1/me/library").set(collector.auth).expect(200);
+      assert.deepEqual(collectorLibrary.body.tracks.map((t) => t.id), [first.id]);
+      assert.ok(single, "single from the earlier test is registered");
     });
   });
 });

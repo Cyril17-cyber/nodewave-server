@@ -106,3 +106,5 @@ public
 # Temporary folders
 tmp/
 temp/
+# Uploaded audio and locally served public files
+storage/

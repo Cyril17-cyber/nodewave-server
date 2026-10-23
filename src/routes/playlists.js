@@ -5,6 +5,7 @@ import { nodewaveAbi, publicClient } from "../chain/client.js";
 import { config } from "../config.js";
 import { pool, withTransaction } from "../db/pool.js";
 import { badRequest, conflict, forbidden, notFound, unavailable } from "../lib/errors.js";
+import { listReleases } from "../lib/releases.js";
 import { selectTracks } from "../lib/tracks.js";
 import { accountView, publicProfile } from "../lib/users.js";
 import { optionalAuth, requireAuth } from "../middleware/auth.js";
@@ -30,32 +31,12 @@ router.get(
       limit: z.coerce.number().int().min(1).max(100).default(30),
       offset: z.coerce.number().int().min(0).default(0),
       type: z.enum(["Single", "EP", "Album"]).optional(),
+      artisteId: z.coerce.number().int().positive().optional(),
     }),
   }),
   async (req, res) => {
-    const { limit, offset, type } = req.query;
-    // One extra row tells us whether another page exists
-    const { rows } = await pool.query(
-      `SELECT p.id, p.playlist_type, p.cover, p.title, p.genre, p.record_label, p.created_at,
-              u.id AS artiste_id, u.name AS artiste_name, u.display_picture_url AS artiste_picture,
-              stats.track_count, stats.min_price_wei, stats.release_year
-       FROM playlist p
-       JOIN users u ON u.id = p.artiste_id
-       CROSS JOIN LATERAL (
-         SELECT count(*)::int AS track_count, min(m.price_wei) AS min_price_wei, min(m.release_year) AS release_year
-         FROM music m WHERE m.album_id = p.id
-       ) stats
-       WHERE $3::text IS NULL OR p.playlist_type = $3
-       ORDER BY p.created_at DESC, p.id DESC
-       LIMIT $1 OFFSET $2`,
-      [limit + 1, offset, type ?? null]
-    );
-    const hasMore = rows.length > limit;
-    const playlists = rows.slice(0, limit).map(({ min_price_wei, ...p }) => ({
-      ...p,
-      min_price: min_price_wei == null ? null : formatEther(BigInt(min_price_wei)),
-    }));
-    res.json({ playlists, nextOffset: hasMore ? offset + limit : null });
+    const { limit, offset, type, artisteId } = req.query;
+    res.json(await listReleases({ limit, offset, type: type ?? null, artisteId: artisteId ?? null }));
   }
 );
 
@@ -101,6 +82,8 @@ router.post(
             producers: text(500).default(""),
             explicit: z.boolean().default(false),
             songDuration: text(20).default(""),
+            // From POST /v1/uploads/track; ties the token to its private full-length audio
+            audioId: z.string().regex(/^[0-9a-f]{64}$/, "Invalid audio id"),
           })
         )
         .min(1)
@@ -145,6 +128,22 @@ router.post(
       throw forbidden("Link the wallet that minted this release to your account first.", "WALLET_NOT_LINKED");
     }
 
+    // Each token must have been minted with the metadata the API made for this user's upload,
+    // so nobody can attach audio to a token they didn't create (or reuse an upload twice)
+    const audioIds = tracks.map((t) => t.audioId);
+    if (new Set(audioIds).size !== audioIds.length) throw badRequest("Each track needs its own audio.", "AUDIO_MISMATCH");
+    const { rows: audios } = await pool.query(
+      `SELECT a.id, a.metadata_uri FROM audio_files a
+       WHERE a.id = ANY($1) AND a.user_id = $2 AND NOT EXISTS (SELECT 1 FROM music m WHERE m.audio_id = a.id)`,
+      [audioIds, req.userId]
+    );
+    const metadataUri = new Map(audios.map((a) => [a.id, a.metadata_uri]));
+    tracks.forEach((song, index) => {
+      if (metadataUri.get(song.audioId) !== minted[index].args.uri) {
+        throw badRequest(`Track ${index + 1} wasn't minted with its uploaded audio.`, "AUDIO_MISMATCH");
+      }
+    });
+
     const now = new Date();
     const releaseDay = `${ordinal(now.getUTCDate())} ${MONTHS[now.getUTCMonth()]}`;
     const releaseYear = String(now.getUTCFullYear());
@@ -160,11 +159,11 @@ router.post(
         const { tokenId, price } = minted[index].args;
         await client.query(
           `INSERT INTO music (title, featured_artistes, writers, producers, explicit, song_duration,
-                              price, price_wei, token_id, artiste_id, album_id, release_day, release_year)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                              price, price_wei, token_id, artiste_id, album_id, release_day, release_year, audio_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
           [
             song.title, song.featuredArtistes, song.writers, song.producers, song.explicit, song.songDuration,
-            formatEther(price), price.toString(), tokenId.toString(), req.userId, rows[0].id, releaseDay, releaseYear,
+            formatEther(price), price.toString(), tokenId.toString(), req.userId, rows[0].id, releaseDay, releaseYear, song.audioId,
           ]
         );
       }

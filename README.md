@@ -47,7 +47,24 @@ should keep them in secure storage (e.g. `expo-secure-store`).
 
 1. Link the minting wallet: `POST /v1/wallets/nonce`, sign a Sign-In With Ethereum
    message containing the nonce, then `POST /v1/wallets { message, signature }`.
-2. Upload the cover and audio: `POST /v1/uploads?kind=image|audio` (multipart field `file`).
-3. Call `mintCollection` on the contract.
-4. `POST /v1/playlists { txHash, type, title, ..., tracks }`. The API reads token IDs
-   and prices from the transaction's events.
+2. Upload the cover: `POST /v1/uploads?kind=image` (multipart field `file`).
+3. Upload each track: `POST /v1/uploads/track` (multipart `file`, `title`, `coverUri`,
+   `genre`, `explicit`). Returns `{ audioId, uri, previewUrl }`.
+4. Call `mintCollection` with the returned `uri`s.
+5. `POST /v1/playlists { txHash, type, title, ..., tracks: [{ ..., audioId }] }`. The API
+   reads token IDs and prices from the transaction and checks each token was minted
+   with its upload's metadata.
+
+## Token-gated audio
+
+Full tracks never go to IPFS. They're stored privately in `STORAGE_DIR` (the API's
+disk) and streamed only through `GET /v1/tracks/:id/stream`, which checks the caller
+owns a copy and returns a link that expires after `MEDIA_URL_TTL_SECONDS`.
+
+Everything public (covers, the 30-second previews ffmpeg cuts at upload, and token
+metadata) goes to Pinata when `PINATA_JWT` and `PINATA_GATEWAY` are set, otherwise to
+`STORAGE_DIR/public`, served at `/v1/media/public`. In production, `STORAGE_DIR` must
+be on a persistent disk and `API_PUBLIC_URL` must be the API's public address.
+
+ffmpeg comes with the `ffmpeg-static` package. If npm blocked its install script,
+run `npm approve-scripts ffmpeg-static` and reinstall.

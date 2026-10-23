@@ -1,4 +1,5 @@
 import "dotenv/config";
+import path from "node:path";
 import { z } from "zod";
 
 const csv = z
@@ -41,9 +42,17 @@ const schema = z.object({
   GOOGLE_CLIENT_IDS: csv,
   GOOGLECLIENTID: optionalString,
 
+  // Public files (covers, previews, metadata) go to Pinata when configured, else to local disk
   PINATA_JWT: optionalString,
   PINATA_GATEWAY: optionalString, // e.g. my-gateway.mypinata.cloud
   MAX_UPLOAD_MB: z.coerce.number().default(50),
+
+  // Full tracks are stored here and only ever streamed to owners
+  STORAGE_DIR: z.string().default("./storage"),
+  // How browsers reach this API (used in signed media links and locally served files)
+  API_PUBLIC_URL: optionalString,
+  MEDIA_URL_TTL_SECONDS: z.coerce.number().int().min(60).default(60 * 60),
+  PREVIEW_SECONDS: z.coerce.number().int().min(5).max(120).default(30),
 
   RPC_URL: optionalString,
   CONTRACT_ADDRESS: optionalString,
@@ -75,5 +84,8 @@ export const config = {
     : [env.GOOGLECLIENTID].filter(Boolean),
   SIWE_DOMAINS: env.SIWE_DOMAINS.length ? env.SIWE_DOMAINS : [new URL(env.CLIENTURL).host],
   CONTRACT_ADDRESS: env.CONTRACT_ADDRESS?.toLowerCase(),
+  API_PUBLIC_URL: (env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`).replace(/\/$/, ""),
+  STORAGE_DIR: path.resolve(env.STORAGE_DIR),
+  pinataEnabled: Boolean(env.PINATA_JWT && env.PINATA_GATEWAY),
   chainEnabled: Boolean(env.RPC_URL && env.CONTRACT_ADDRESS),
 };

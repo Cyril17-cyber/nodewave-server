@@ -66,6 +66,28 @@ const handlers = {
     await db.query("UPDATE chain_resale_listings SET active = false WHERE listing_id = $1", [listingId.toString()]);
   },
 
+  async TradeOfferCreated(db, args, log) {
+    await db.query(
+      `INSERT INTO chain_trade_offers (trade_id, maker_address, taker_address, offered_token_id, offered_amount,
+                                       requested_token_id, requested_amount, created_tx_hash, created_block)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (trade_id) DO NOTHING`,
+      [
+        args.tradeId.toString(), lower(args.maker), lower(args.taker),
+        args.offeredTokenId.toString(), args.offeredAmount.toString(),
+        args.requestedTokenId.toString(), args.requestedAmount.toString(),
+        log.transactionHash, log.blockNumber.toString(),
+      ]
+    );
+  },
+
+  async TradeOfferAccepted(db, { tradeId }) {
+    await db.query("UPDATE chain_trade_offers SET status = 'accepted' WHERE trade_id = $1", [tradeId.toString()]);
+  },
+
+  async TradeOfferCancelled(db, { tradeId }) {
+    await db.query("UPDATE chain_trade_offers SET status = 'cancelled' WHERE trade_id = $1", [tradeId.toString()]);
+  },
+
   async TransferSingle(db, { from, to, id, value }) {
     await moveBalance(db, from, to, id, value);
   },
@@ -106,7 +128,8 @@ async function getCursor() {
 
 /** Indexes every confirmed block not yet processed. Returns the number of events applied. */
 export async function syncOnce() {
-  const head = await publicClient.getBlockNumber();
+  // viem caches the block number for a few seconds by default; the indexer needs the real head
+  const head = await publicClient.getBlockNumber({ cacheTime: 0 });
   const safeHead = head - config.INDEXER_CONFIRMATIONS + 1n;
   let from = (await getCursor()) + 1n;
   let applied = 0;
