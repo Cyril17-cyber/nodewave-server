@@ -29,9 +29,13 @@ function layout({ name, paragraphs, code, buttonLabel, buttonUrl }) {
   ${paragraphs.map((p) => `<p>${p}</p>`).join("\n  ")}
   <p style="font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #fe8040; text-align: center;">${code}</p>
   <p>This code expires in <b>${OTP_TTL_MINUTES} minutes</b>.</p>
-  <p style="text-align: center; margin: 30px 0;">
+  ${
+    buttonUrl
+      ? `<p style="text-align: center; margin: 30px 0;">
     <a href="${buttonUrl}" style="text-decoration: none; padding: 16px 24px; color: #fff; background: #fe8040; border-radius: 0.25rem; font-weight: 600;">${buttonLabel}</a>
-  </p>
+  </p>`
+      : ""
+  }
   <p>From all of us at <a href="${config.CLIENTURL}" style="color: #fe8040; font-weight: 800;">Nodewave</a>.</p>
 </div>`;
 }
@@ -89,5 +93,22 @@ export function sendPasswordResetEmail(user, code) {
       buttonUrl: codeLink("change-pass", user.email, code),
     }),
     meta: { purpose: "reset_password", code },
+  });
+}
+
+export function sendPasswordChangeEmail(user, code) {
+  return send({
+    to: user.email,
+    subject: `${code} is your Nodewave password change code`,
+    text: `Your Nodewave password change code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes. If you didn't ask to change your password, sign in and change it now.`,
+    html: layout({
+      name: user.name,
+      paragraphs: [
+        "You asked to change your password from your account settings. Enter this code there to confirm it.",
+        "If this wasn't you, someone may know your password: sign in and change it now.",
+      ],
+      code,
+    }),
+    meta: { purpose: "change_password", code },
   });
 }

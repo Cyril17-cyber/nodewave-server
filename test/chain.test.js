@@ -4,7 +4,7 @@ import { apiPath, makeTone, setup } from "./helpers.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { after, before, describe, it } from "node:test";
-import { createPublicClient, createWalletClient, defineChain, getAddress, http, parseEther } from "viem";
+import { createPublicClient, createWalletClient, defineChain, formatEther, getAddress, http, parseEther } from "viem";
 import { createSiweMessage } from "viem/siwe";
 
 const RPC = process.env.TEST_RPC_URL || "http://127.0.0.1:8545";
@@ -258,6 +258,30 @@ describe("on-chain flows", { skip: chainId ? false : `no Ethereum node at ${RPC}
       const collectorLibrary = await ctx.api().get("/v1/me/library").set(collector.auth).expect(200);
       assert.deepEqual(collectorLibrary.body.tracks.map((t) => t.id), [first.id]);
       assert.ok(single, "single from the earlier test is registered");
+    });
+
+    it("sums sales, resales, mint fees and purchases for the dashboard", async () => {
+      const artistBoard = await ctx.api().get("/v1/me/dashboard").set(artist.auth).expect(200);
+      const { body } = artistBoard;
+      assert.equal(body.releases, 2);
+      assert.equal(body.collectors, 2);
+      assert.equal(body.sales.copiesSold, 1);
+      assert.equal(body.sales.total, "0.01");
+      assert.equal(body.sales.resoldCopies, 1);
+      assert.equal(body.sales.resaleVolume, "0.03");
+      assert.deepEqual(body.resales, { copies: 1, total: "0.03" }, "the artiste resold their own copy");
+      // Two collections: 2 tracks × 5 copies, then 1 track × 5 copies, at the collection listing price
+      const fee = await publicClient.readContract({ address, abi, functionName: "collectionListingPrice" });
+      assert.equal(body.spending.minting.mints, 2);
+      assert.equal(body.spending.minting.total, formatEther(fee * 15n));
+      assert.equal(body.sales.recent.length, 2);
+
+      const buyerBoard = await ctx.api().get("/v1/me/dashboard").set(buyer.auth).expect(200);
+      assert.deepEqual(buyerBoard.body.spending.primary, { copies: 1, total: "0.01" });
+      assert.equal(buyerBoard.body.sales.copiesSold, 0);
+      const collectorBoard = await ctx.api().get("/v1/me/dashboard").set(collector.auth).expect(200);
+      assert.deepEqual(collectorBoard.body.spending.resale, { copies: 1, total: "0.03" });
+      assert.deepEqual(collectorBoard.body.spending.byGenre, [{ genre: "Afrobeats", copies: 1, total: "0.03" }]);
     });
   });
 });

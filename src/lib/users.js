@@ -1,4 +1,11 @@
+import { z } from "zod";
 import { pool } from "../db/pool.js";
+
+// bcrypt only uses the first 72 bytes, so longer passwords would be silently truncated
+export const passwordSchema = z
+  .string()
+  .min(8, "Password must be at least 8 characters")
+  .refine((value) => Buffer.byteLength(value) <= 72, "Password must be at most 72 bytes");
 
 /** Fields of another user that anyone may see. */
 export function publicProfile(user) {
@@ -22,6 +29,7 @@ export const findUserById = async (id, db = pool) =>
 export async function accountView(userId, db = pool) {
   const { rows } = await db.query(
     `SELECT u.id, u.uuid, u.name, u.email, u.display_picture_url, u.verified, u.provider,
+            (u.password IS NOT NULL) AS has_password,
             coalesce((SELECT array_agg(f.music_id::text ORDER BY f.created_at)
                       FROM favorites f WHERE f.user_id = u.id), '{}') AS favorites,
             coalesce((SELECT array_agg(m.id::text ORDER BY m.id)

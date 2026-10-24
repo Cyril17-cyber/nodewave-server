@@ -17,6 +17,7 @@ const handlers = {
        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (token_id) DO NOTHING`,
       [tokenId.toString(), uri, lower(artiste), price.toString(), supply.toString(), log.transactionHash, log.blockNumber.toString()]
     );
+    await recordMintFee(db, artiste, log);
   },
 
   async CollectionCreated(db, { collectionId, firstTokenId, trackCount }) {
@@ -27,8 +28,11 @@ const handlers = {
   },
 
   async MarketItemSold(db, { tokenId, buyer, amount, totalPrice }, log) {
-    await db.query("UPDATE chain_tokens SET supply = supply - $2 WHERE token_id = $1", [tokenId.toString(), amount.toString()]);
-    await recordPurchase(db, log, "primary", tokenId, buyer, amount, totalPrice);
+    const { rows } = await db.query(
+      "UPDATE chain_tokens SET supply = supply - $2 WHERE token_id = $1 RETURNING artiste_address",
+      [tokenId.toString(), amount.toString()]
+    );
+    await recordPurchase(db, log, "primary", tokenId, buyer, rows[0]?.artiste_address, amount, totalPrice);
   },
 
   async MarketItemWithdrawn(db, { tokenId, amount }) {
@@ -56,10 +60,12 @@ const handlers = {
   async ResaleSold(db, { listingId, buyer, amount, totalPrice }, log) {
     const { rows } = await db.query(
       `UPDATE chain_resale_listings SET amount = amount - $2, active = (amount - $2) > 0
-       WHERE listing_id = $1 RETURNING token_id`,
+       WHERE listing_id = $1 RETURNING token_id, seller_address`,
       [listingId.toString(), amount.toString()]
     );
-    if (rows[0]) await recordPurchase(db, log, "resale", BigInt(rows[0].token_id), buyer, amount, totalPrice);
+    if (rows[0]) {
+      await recordPurchase(db, log, "resale", BigInt(rows[0].token_id), buyer, rows[0].seller_address, amount, totalPrice);
+    }
   },
 
   async ResaleCancelled(db, { listingId }) {
@@ -111,11 +117,28 @@ async function moveBalance(db, from, to, tokenId, amount) {
   if (to !== ZERO_ADDRESS) await change(to, amount.toString());
 }
 
-function recordPurchase(db, log, kind, tokenId, buyer, amount, totalPrice) {
+function recordPurchase(db, log, kind, tokenId, buyer, seller, amount, totalPrice) {
   return db.query(
-    `INSERT INTO purchases (tx_hash, log_index, kind, token_id, buyer_address, amount, total_price_wei, block_number)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`,
-    [log.transactionHash, log.logIndex, kind, tokenId.toString(), lower(buyer), amount.toString(), totalPrice.toString(), log.blockNumber.toString()]
+    `INSERT INTO purchases (tx_hash, log_index, kind, token_id, buyer_address, seller_address, amount, total_price_wei, block_number)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
+    [
+      log.transactionHash, log.logIndex, kind, tokenId.toString(), lower(buyer), seller ?? null,
+      amount.toString(), totalPrice.toString(), log.blockNumber.toString(),
+    ]
+  );
+}
+
+/**
+ * The listing fee is the mint transaction's value (the contract requires it exactly; owner
+ * mints pay nothing). An album mints many tokens in one transaction, so it's fetched once.
+ */
+async function recordMintFee(db, artiste, log) {
+  const { rows } = await db.query("SELECT 1 FROM chain_mints WHERE tx_hash = $1", [log.transactionHash]);
+  if (rows[0]) return;
+  const tx = await publicClient.getTransaction({ hash: log.transactionHash });
+  await db.query(
+    "INSERT INTO chain_mints (tx_hash, artiste_address, fee_wei, block_number) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    [log.transactionHash, lower(artiste), tx.value.toString(), log.blockNumber.toString()]
   );
 }
 

@@ -118,6 +118,79 @@ describe("password reset", () => {
   });
 });
 
+describe("account settings", () => {
+  it("renames the account", async () => {
+    const user = await createUser();
+    const res = await api().patch("/v1/me").set(user.auth).send({ name: "  New Name  " }).expect(200);
+    assert.equal(res.body.user.name, "New Name");
+    await api().patch("/v1/me").set(user.auth).send({ name: " " }).expect(400);
+  });
+
+  it("replaces and removes the profile picture", async () => {
+    const cid = "QmAvatarCid1234567890abcdefghijklmnopqrstuvwxyz";
+    const fetchMock = stubFetch({ "https://api.pinata.cloud/pinning/pinFileToIPFS": () => json({ IpfsHash: cid }) });
+    try {
+      const user = await createUser();
+      const pdf = await api().put("/v1/me/avatar").set(user.auth).attach("file", Buffer.from("x"), { filename: "a.pdf", contentType: "application/pdf" });
+      assert.equal(pdf.status, 400);
+      const res = await api()
+        .put("/v1/me/avatar")
+        .set(user.auth)
+        .attach("file", Buffer.from("png"), { filename: "me.png", contentType: "image/png" })
+        .expect(200);
+      assert.equal(res.body.user.display_picture_url, `https://test.mypinata.cloud/ipfs/${cid}`);
+      const removed = await api().delete("/v1/me/avatar").set(user.auth).expect(200);
+      assert.equal(removed.body.user.display_picture_url, null);
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+
+  it("changes the password with the current password and an emailed code, keeping only this login", async () => {
+    const user = await createUser("change@example.com", "old-password");
+    const otherDevice = await api().post("/v1/auth/login").send({ email: user.email, password: "old-password" }).expect(200);
+
+    const wrong = await api().post("/v1/me/password/code").set(user.auth).send({ currentPassword: "nope" }).expect(400);
+    assert.equal(wrong.body.code, "WRONG_PASSWORD");
+    const sent = await api().post("/v1/me/password/code").set(user.auth).send({ currentPassword: "old-password" }).expect(200);
+    assert.equal(sent.body.sent, true);
+    const code = lastCode(user.email, "change_password");
+    assert.ok(!JSON.stringify(sent.body).includes(code));
+
+    // The code is only good for this account's password change
+    await api().post("/v1/auth/password/reset").send({ email: user.email, code, password: "hijacked-pass" }).expect(400);
+    const wrongCode = code === "000000" ? "111111" : "000000";
+    const bad = await api().post("/v1/me/password").set(user.auth).send({ code: wrongCode, password: "new-password" }).expect(400);
+    assert.equal(bad.body.code, "INVALID_CODE");
+    await api().post("/v1/me/password").set(user.auth).send({ code, password: "short" }).expect(400);
+    await api().post("/v1/me/password").set(user.auth).send({ code, password: "new-password" }).expect(200);
+    await api().post("/v1/me/password").set(user.auth).send({ code, password: "new-password" }).expect(400);
+
+    await api().post("/v1/auth/login").send({ email: user.email, password: "old-password" }).expect(401);
+    await api().post("/v1/auth/login").send({ email: user.email, password: "new-password" }).expect(200);
+    await api().post("/v1/auth/refresh").send({ refreshToken: user.refreshToken }).expect(200);
+    await api().post("/v1/auth/refresh").send({ refreshToken: otherDevice.body.refreshToken }).expect(401);
+  });
+
+  it("lets a social account set a password without a current one", async () => {
+    const user = await createUser();
+    await pool.query("UPDATE users SET password = NULL, provider = 'google' WHERE id = $1", [user.user.id]);
+    await api().post("/v1/me/password/code").set(user.auth).send({}).expect(200);
+    const code = lastCode(user.email, "change_password");
+    await api().post("/v1/me/password").set(user.auth).send({ code, password: "first-password" }).expect(200);
+    await api().post("/v1/auth/login").send({ email: user.email, password: "first-password" }).expect(200);
+  });
+
+  it("shows an empty dashboard for accounts without wallets", async () => {
+    const user = await createUser();
+    const { body } = await api().get("/v1/me/dashboard").set(user.auth).expect(200);
+    assert.equal(body.wallets, 0);
+    assert.equal(body.sales.total, "0");
+    assert.equal(body.spending.total, "0");
+    assert.deepEqual(body.sales.byTrack, []);
+  });
+});
+
 describe("sessions", () => {
   it("rotates refresh tokens and revokes that login's tokens when an old one is reused", async () => {
     const user = await createUser();

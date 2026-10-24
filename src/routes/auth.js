@@ -8,18 +8,14 @@ import { sendPasswordResetEmail, sendVerificationEmail } from "../lib/mailer.js"
 import { verifyGoogleIdToken, verifySpotifyAccessToken } from "../lib/oauth.js";
 import { consumeOtp, issueOtp } from "../lib/otp.js";
 import { issueSession, revokeAllSessions, revokeRefreshToken, rotateRefreshToken } from "../lib/tokens.js";
-import { accountView, findUserByEmail } from "../lib/users.js";
+import { accountView, findUserByEmail, passwordSchema } from "../lib/users.js";
 import { authLimiter, emailLimiter } from "../middleware/rateLimit.js";
 import { validate } from "../middleware/validate.js";
 
 const router = Router();
 
 const email = z.email("Enter a valid email address").trim().toLowerCase();
-// bcrypt only uses the first 72 bytes, so longer passwords would be silently truncated
-const password = z
-  .string()
-  .min(8, "Password must be at least 8 characters")
-  .refine((value) => Buffer.byteLength(value) <= 72, "Password must be at most 72 bytes");
+const password = passwordSchema;
 const code = z.string().trim().regex(/^\d{6}$/, "Enter the 6-digit code");
 
 // Compared against when the email is unknown, so response time doesn't reveal which emails exist

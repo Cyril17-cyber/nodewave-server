@@ -8,15 +8,16 @@ const JWT_OPTIONS = { algorithm: "HS256", issuer: "nodewave-api", audience: "nod
 
 export const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
 
-export function signAccessToken(userId) {
-  return jwt.sign({}, config.JWT_SECRET, {
+/** `sid` names the login (refresh token family) the access token was issued to. */
+export function signAccessToken(userId, familyId) {
+  return jwt.sign(familyId ? { sid: familyId } : {}, config.JWT_SECRET, {
     ...JWT_OPTIONS,
     subject: String(userId),
     expiresIn: config.ACCESS_TOKEN_TTL_SECONDS,
   });
 }
 
-/** Returns the user id in a valid access token, or throws 401. */
+/** Returns { userId, sessionId } from a valid access token, or throws 401. */
 export function verifyAccessToken(token) {
   try {
     const payload = jwt.verify(token, config.JWT_SECRET, {
@@ -24,7 +25,7 @@ export function verifyAccessToken(token) {
       issuer: JWT_OPTIONS.issuer,
       audience: JWT_OPTIONS.audience,
     });
-    return Number(payload.sub);
+    return { userId: Number(payload.sub), sessionId: payload.sid };
   } catch {
     throw unauthorized("Invalid or expired access token", "INVALID_TOKEN");
   }
@@ -46,7 +47,7 @@ async function createRefreshToken(db, userId, familyId) {
  */
 export async function issueSession(userId, db = pool, familyId = crypto.randomUUID()) {
   return {
-    accessToken: signAccessToken(userId),
+    accessToken: signAccessToken(userId, familyId),
     accessTokenExpiresAt: Date.now() + config.ACCESS_TOKEN_TTL_SECONDS * 1000,
     refreshToken: await createRefreshToken(db, userId, familyId),
   };
@@ -90,6 +91,11 @@ export async function revokeRefreshToken(token) {
   ]);
 }
 
-export async function revokeAllSessions(userId, db = pool) {
-  await db.query("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL", [userId]);
+/** Signs the user out everywhere, or everywhere but one login (`exceptFamilyId`). */
+export async function revokeAllSessions(userId, db = pool, exceptFamilyId = null) {
+  await db.query(
+    `UPDATE refresh_tokens SET revoked_at = now()
+     WHERE user_id = $1 AND revoked_at IS NULL AND family_id IS DISTINCT FROM $2`,
+    [userId, exceptFamilyId]
+  );
 }
