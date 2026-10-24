@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "../config.js";
 import { pinFile, pinJson, unpin } from "./pinata.js";
+import { removeObject, signedObjectUrl, uploadObject } from "./supabase.js";
 
 export const sha256Hex = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
 
@@ -19,19 +20,40 @@ const EXTENSIONS = {
 };
 
 /**
- * Owner-only files (full tracks). Kept on the API's disk and only ever served through
- * signed, expiring links. Swap this object for an S3/R2 implementation to move storage.
+ * Owner-only files (full tracks), only ever served through signed, expiring links.
+ * Kept in a private Supabase Storage bucket when it's configured, otherwise on the API's disk.
+ * `send` answers a request whose link has already been verified.
  */
-export const privateStorage = {
+const diskPrivateStorage = {
   async put(id, buffer) {
     await fs.mkdir(PRIVATE_DIR, { recursive: true });
     await fs.writeFile(path.join(PRIVATE_DIR, id), buffer);
   },
-  path: (id) => path.join(PRIVATE_DIR, id),
   async remove(id) {
     await fs.rm(path.join(PRIVATE_DIR, id), { force: true });
   },
+  // sendFile handles Range requests, so seeking works
+  send: (res, id, { contentType, maxAge }) =>
+    new Promise((resolve, reject) =>
+      res.sendFile(
+        path.join(PRIVATE_DIR, id),
+        { headers: { "Content-Type": contentType, "Cache-Control": `private, max-age=${maxAge}` } },
+        (error) => (error && !res.headersSent ? reject(error) : resolve())
+      )
+    ),
 };
+
+const supabasePrivateStorage = {
+  put: (id, buffer, contentType) => uploadObject(id, buffer, contentType),
+  remove: (id) => removeObject(id),
+  // Redirect to a Supabase link that lasts as long as ours, so the bytes don't pass through the API
+  async send(res, id, { maxAge }) {
+    const url = await signedObjectUrl(id, Math.max(maxAge, 60));
+    res.set("Cache-Control", `private, max-age=${maxAge}`).redirect(302, url);
+  },
+};
+
+export const privateStorage = config.supabaseStorageEnabled ? supabasePrivateStorage : diskPrivateStorage;
 
 /**
  * Public files (covers, previews, token metadata). Pinned to IPFS through Pinata when it's

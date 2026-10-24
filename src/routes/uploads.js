@@ -95,7 +95,7 @@ router.post(
       `${title}.json`
     );
 
-    await privateStorage.put(id, req.file.buffer);
+    await privateStorage.put(id, req.file.buffer, req.file.mimetype);
     await pool.query(
       `INSERT INTO audio_files (id, user_id, mime_type, size_bytes, preview_url, metadata_uri)
        VALUES ($1, $2, $3, $4, $5, $6)

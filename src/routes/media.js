@@ -24,7 +24,7 @@ router.get(
     params: z.object({ id: z.string().regex(/^[0-9a-f]{64}$/) }),
     query: z.object({ exp: z.string(), sig: z.string() }),
   }),
-  async (req, res, next) => {
+  async (req, res) => {
     if (!verifyAudioSignature(req.params.id, req.query.exp, req.query.sig)) {
       throw forbidden("This link has expired.", "LINK_EXPIRED");
     }
@@ -32,11 +32,7 @@ router.get(
     if (!rows[0]) throw notFound("Audio not found", "AUDIO_NOT_FOUND");
 
     const maxAge = Math.max(0, Number(req.query.exp) - Math.floor(Date.now() / 1000));
-    res.sendFile(
-      privateStorage.path(req.params.id),
-      { headers: { "Content-Type": rows[0].mime_type, "Cache-Control": `private, max-age=${maxAge}` } },
-      (error) => error && !res.headersSent && next(error)
-    );
+    await privateStorage.send(res, req.params.id, { contentType: rows[0].mime_type, maxAge });
   }
 );
 

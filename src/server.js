@@ -11,6 +11,9 @@ const server = createApp().listen(config.PORT, () => {
 
 const stopIndexer = config.chainEnabled ? startIndexer() : null;
 if (!stopIndexer) console.warn("RPC_URL / CONTRACT_ADDRESS not set: indexer and mint registration are disabled");
+if (config.isProd && !config.supabaseStorageEnabled) console.warn(`Full tracks are stored on local disk (${config.STORAGE_DIR}); it must be persistent`);
+if (config.isProd && !config.pinataEnabled) console.warn(`Public files are stored on local disk (${config.STORAGE_DIR}); it must be persistent`);
+if (config.DATABASE_SSL && !config.DATABASE_SSL_CA) console.warn("DATABASE_SSL_CA not set: the database's certificate isn't verified");
 
 function shutdown(signal) {
   console.log(`${signal} received, shutting down`);

@@ -7,6 +7,8 @@ export const pool = new pg.Pool({
   user: config.DATABASE_USER,
   password: config.DATABASE_PASSWORD,
   database: config.DATABASE_NAME,
+  // Without the CA the connection is still encrypted, but the server's certificate isn't checked
+  ssl: config.DATABASE_SSL && (config.DATABASE_SSL_CA ? { ca: config.DATABASE_SSL_CA } : { rejectUnauthorized: false }),
   max: 10,
 });
 

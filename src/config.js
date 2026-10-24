@@ -22,6 +22,10 @@ const schema = z.object({
   DATABASE_USER: z.string(),
   DATABASE_PASSWORD: z.string().default(""),
   DATABASE_NAME: z.string(),
+  // Encrypt the connection (needed for hosted databases like Supabase). With DATABASE_SSL_CA
+  // (the server's CA certificate, PEM) the server's identity is verified too.
+  DATABASE_SSL: z.stringbool().default(false),
+  DATABASE_SSL_CA: optionalString,
 
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().default(15 * 60),
@@ -47,7 +51,10 @@ const schema = z.object({
   PINATA_GATEWAY: optionalString, // e.g. my-gateway.mypinata.cloud
   MAX_UPLOAD_MB: z.coerce.number().default(50),
 
-  // Full tracks are stored here and only ever streamed to owners
+  // Full tracks go to this private Supabase Storage bucket when configured, else to STORAGE_DIR
+  SUPABASE_URL: optionalString, // e.g. https://<project-ref>.supabase.co
+  SUPABASE_SERVICE_KEY: optionalString, // secret / service_role key: server only
+  SUPABASE_BUCKET: z.string().default("tracks"),
   STORAGE_DIR: z.string().default("./storage"),
   // How browsers reach this API (used in signed media links and locally served files)
   API_PUBLIC_URL: optionalString,
@@ -86,6 +93,10 @@ export const config = {
   CONTRACT_ADDRESS: env.CONTRACT_ADDRESS?.toLowerCase(),
   API_PUBLIC_URL: (env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`).replace(/\/$/, ""),
   STORAGE_DIR: path.resolve(env.STORAGE_DIR),
+  // Env vars can't hold newlines everywhere, so accept "\n" in the PEM too
+  DATABASE_SSL_CA: env.DATABASE_SSL_CA?.replace(/\\n/g, "\n"),
+  SUPABASE_URL: env.SUPABASE_URL?.replace(/\/$/, ""),
+  supabaseStorageEnabled: Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY),
   pinataEnabled: Boolean(env.PINATA_JWT && env.PINATA_GATEWAY),
   chainEnabled: Boolean(env.RPC_URL && env.CONTRACT_ADDRESS),
 };
