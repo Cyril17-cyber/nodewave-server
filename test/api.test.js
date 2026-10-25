@@ -263,14 +263,63 @@ describe("social sign-in", () => {
     }
   });
 
-  it("won't attach a Spotify login to someone else's existing account by email", async () => {
+  it("won't attach a Spotify login to someone else's existing account without the emailed code", async () => {
     const victim = await createUser("victim@example.com");
     const fetchMock = stubFetch({
       "https://api.spotify.com/v1/me": () => json({ id: "attacker", email: victim.email, display_name: "A" }),
     });
     try {
       const res = await api().post("/v1/auth/oauth/spotify").send({ accessToken: "attacker-token" }).expect(409);
-      assert.equal(res.body.code, "EMAIL_IN_USE");
+      assert.equal(res.body.code, "OAUTH_LINK_REQUIRED");
+      assert.ok(!JSON.stringify(res.body).includes(lastCode(victim.email, "link_oauth")));
+
+      // Guessing fails, and the link is destroyed after 5 wrong codes
+      const { linkToken } = res.body.details;
+      for (let i = 0; i < 5; i++) {
+        await api().post("/v1/auth/oauth/link").send({ linkToken, code: "000000" }).expect(400);
+      }
+      const late = await api()
+        .post("/v1/auth/oauth/link")
+        .send({ linkToken, code: lastCode(victim.email, "link_oauth") })
+        .expect(400);
+      assert.equal(late.body.code, "INVALID_CODE");
+      const { rows } = await pool.query("SELECT 1 FROM oauth_accounts WHERE provider_account_id = 'attacker'");
+      assert.equal(rows.length, 0);
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+
+  it("links Spotify to an existing account once the owner enters the emailed code", async () => {
+    const owner = await createUser("spotify-owner@example.com");
+    const fetchMock = stubFetch({
+      "https://api.spotify.com/v1/me": () => json({ id: "owner-spotify", email: owner.email, display_name: "Owner" }),
+    });
+    try {
+      const res = await api().post("/v1/auth/oauth/spotify").send({ accessToken: "t" }).expect(409);
+      const sent = testOutbox.findLast((mail) => mail.to === owner.email && mail.purpose === "link_oauth");
+      assert.match(sent.subject, /Spotify/);
+
+      // A second attempt within a minute doesn't send another email
+      const again = await api().post("/v1/auth/oauth/spotify").send({ accessToken: "t" }).expect(409);
+      assert.equal(again.body.code, "OAUTH_LINK_COOLDOWN");
+
+      // The code only works together with the link token from the same sign-in
+      await api().post("/v1/auth/oauth/link").send({ linkToken: "someone-elses", code: sent.code }).expect(400);
+      const linked = await api()
+        .post("/v1/auth/oauth/link")
+        .send({ linkToken: res.body.details.linkToken, code: sent.code })
+        .expect(200);
+      assert.equal(linked.body.user.id, owner.user.id);
+      assert.ok(linked.body.accessToken);
+
+      // From now on Spotify signs straight in, and the code can't be reused
+      const direct = await api().post("/v1/auth/oauth/spotify").send({ accessToken: "t" }).expect(200);
+      assert.equal(direct.body.user.id, owner.user.id);
+      await api()
+        .post("/v1/auth/oauth/link")
+        .send({ linkToken: res.body.details.linkToken, code: sent.code })
+        .expect(400);
     } finally {
       fetchMock.mock.restore();
     }

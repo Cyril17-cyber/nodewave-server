@@ -3,9 +3,10 @@ import bcrypt from "bcrypt";
 import { z } from "zod";
 import { config } from "../config.js";
 import { withTransaction, pool } from "../db/pool.js";
-import { badRequest, conflict, forbidden, unauthorized } from "../lib/errors.js";
-import { sendPasswordResetEmail, sendVerificationEmail } from "../lib/mailer.js";
+import { AppError, badRequest, conflict, forbidden, unauthorized } from "../lib/errors.js";
+import { sendOAuthLinkEmail, sendPasswordResetEmail, sendVerificationEmail } from "../lib/mailer.js";
 import { verifyGoogleIdToken, verifySpotifyAccessToken } from "../lib/oauth.js";
+import { cancelOAuthLink, consumeOAuthLink, startOAuthLink } from "../lib/oauthLinks.js";
 import { consumeOtp, issueOtp } from "../lib/otp.js";
 import { issueSession, revokeAllSessions, revokeRefreshToken, rotateRefreshToken } from "../lib/tokens.js";
 import { accountView, findUserByEmail, passwordSchema } from "../lib/users.js";
@@ -107,9 +108,28 @@ router.post(
   }
 );
 
+/** Connects a provider identity to an account whose email it has proven. */
+async function linkIdentity(client, userId, identity) {
+  // If someone pre-registered this email with a password and never verified it,
+  // wipe that password so they can't sign into the real owner's account.
+  await client.query(
+    `UPDATE users SET verified = true,
+            password = CASE WHEN verified THEN password ELSE NULL END,
+            display_picture_url = coalesce(display_picture_url, $2)
+     WHERE id = $1`,
+    [userId, identity.image ?? null]
+  );
+  await client.query("INSERT INTO oauth_accounts (provider, provider_account_id, user_id) VALUES ($1, $2, $3)", [
+    identity.provider,
+    identity.providerAccountId,
+    userId,
+  ]);
+}
+
 /**
  * Finds the account for a verified OAuth identity, linking or creating one as needed.
- * An existing account is only linked by email when the provider vouches for that email.
+ * Returns { userId }, or { confirmEmailOf: user } when the email matches an existing account
+ * but the provider doesn't vouch for it, so the owner must confirm by email first.
  */
 async function findOrCreateOAuthUser(identity) {
   return withTransaction(async (client) => {
@@ -117,65 +137,84 @@ async function findOrCreateOAuthUser(identity) {
       "SELECT user_id FROM oauth_accounts WHERE provider = $1 AND provider_account_id = $2",
       [identity.provider, identity.providerAccountId]
     );
-    if (linked.rows[0]) return linked.rows[0].user_id;
+    if (linked.rows[0]) return { userId: linked.rows[0].user_id };
 
     const existing = await findUserByEmail(identity.email, client);
-    let userId;
     if (existing) {
       // Accounts created by this provider before oauth_accounts existed have no link row yet;
       // they were created from this provider's email, so linking them is no new trust.
       const { rows: links } = await client.query("SELECT 1 FROM oauth_accounts WHERE user_id = $1 LIMIT 1", [existing.id]);
       const legacyAccount = existing.provider === identity.provider && !links[0];
-      if (!identity.emailVerified && !legacyAccount) {
-        throw conflict(
-          "An account with this email already exists. Sign in the way you originally signed up.",
-          "EMAIL_IN_USE"
-        );
-      }
-      userId = existing.id;
-      // If someone pre-registered this email with a password and never verified it,
-      // wipe that password so they can't sign into the real owner's account.
-      await client.query(
-        `UPDATE users SET verified = true,
-                password = CASE WHEN verified THEN password ELSE NULL END,
-                display_picture_url = coalesce(display_picture_url, $2)
-         WHERE id = $1`,
-        [userId, identity.image]
-      );
-    } else {
-      const { rows } = await client.query(
-        `INSERT INTO users (name, email, display_picture_url, verified, provider)
-         VALUES ($1, $2, $3, true, $4) RETURNING id`,
-        [identity.name, identity.email.toLowerCase(), identity.image, identity.provider]
-      );
-      userId = rows[0].id;
+      if (!identity.emailVerified && !legacyAccount) return { confirmEmailOf: existing };
+      await linkIdentity(client, existing.id, identity);
+      return { userId: existing.id };
     }
+
+    const { rows } = await client.query(
+      `INSERT INTO users (name, email, display_picture_url, verified, provider)
+       VALUES ($1, $2, $3, true, $4) RETURNING id`,
+      [identity.name, identity.email.toLowerCase(), identity.image, identity.provider]
+    );
     await client.query("INSERT INTO oauth_accounts (provider, provider_account_id, user_id) VALUES ($1, $2, $3)", [
       identity.provider,
       identity.providerAccountId,
-      userId,
+      rows[0].id,
     ]);
-    return userId;
+    return { userId: rows[0].id };
   });
+}
+
+/**
+ * Signs in with a verified OAuth identity. If it needs the account owner's confirmation,
+ * emails them a code and answers 409 OAUTH_LINK_REQUIRED with a link token for POST /oauth/link.
+ */
+async function oauthSignIn(identity, res) {
+  const { userId, confirmEmailOf: user } = await findOrCreateOAuthUser(identity);
+  if (userId) return res.json(await sessionResponse(userId));
+
+  const link = await startOAuthLink(user.id, identity);
+  if (!link) {
+    throw conflict("We emailed this account a code less than a minute ago. Please try again shortly.", "OAUTH_LINK_COOLDOWN");
+  }
+  try {
+    await sendOAuthLinkEmail(user, link.code, identity);
+  } catch (err) {
+    await cancelOAuthLink(link.token);
+    console.error(`Failed to send link_oauth email to user ${user.id}:`, err.message);
+    throw badRequest("We couldn't send the email. Please try again shortly.", "EMAIL_FAILED");
+  }
+  throw new AppError(
+    409,
+    "OAUTH_LINK_REQUIRED",
+    "An account with this email already exists. We've emailed it a code to confirm it's you.",
+    { linkToken: link.token, provider: identity.provider }
+  );
 }
 
 router.post(
   "/oauth/google",
   authLimiter,
   validate({ body: z.object({ idToken: z.string().min(1) }) }),
-  async (req, res) => {
-    const userId = await findOrCreateOAuthUser(await verifyGoogleIdToken(req.body.idToken));
-    res.json(await sessionResponse(userId));
-  }
+  async (req, res) => oauthSignIn(await verifyGoogleIdToken(req.body.idToken), res)
 );
 
 router.post(
   "/oauth/spotify",
   authLimiter,
   validate({ body: z.object({ accessToken: z.string().min(1) }) }),
+  async (req, res) => oauthSignIn(await verifySpotifyAccessToken(req.body.accessToken), res)
+);
+
+/** Finishes an OAUTH_LINK_REQUIRED sign-in with the code emailed to the account. */
+router.post(
+  "/oauth/link",
+  authLimiter,
+  validate({ body: z.object({ linkToken: z.string().min(1).max(100), code }) }),
   async (req, res) => {
-    const userId = await findOrCreateOAuthUser(await verifySpotifyAccessToken(req.body.accessToken));
-    res.json(await sessionResponse(userId));
+    const link = await consumeOAuthLink(req.body.linkToken, req.body.code);
+    if (!link) throw badRequest("That code is invalid or has expired.", "INVALID_CODE");
+    await withTransaction((client) => linkIdentity(client, link.userId, link));
+    res.json(await sessionResponse(link.userId));
   }
 );
 

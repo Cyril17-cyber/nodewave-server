@@ -96,6 +96,26 @@ export function sendPasswordResetEmail(user, code) {
   });
 }
 
+const PROVIDER_NAMES = { spotify: "Spotify", google: "Google" };
+
+export function sendOAuthLinkEmail(user, code, identity) {
+  const provider = PROVIDER_NAMES[identity.provider] ?? identity.provider;
+  return send({
+    to: user.email,
+    subject: `${code} is your code to sign in to Nodewave with ${provider}`,
+    text: `Someone is signing in to your Nodewave account with ${provider} (${identity.name}). Your code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes. If this wasn't you, ignore this email and don't share the code.`,
+    html: layout({
+      name: user.name,
+      paragraphs: [
+        `Someone is signing in to your Nodewave account with the ${provider} account <b>${escapeHtml(identity.name)}</b>. Enter this code on the sign-in page to connect it to your account.`,
+        `If this wasn't you, ignore this email and don't share the code with anyone. Without it, ${provider} can't be connected to your account.`,
+      ],
+      code,
+    }),
+    meta: { purpose: "link_oauth", code },
+  });
+}
+
 export function sendPasswordChangeEmail(user, code) {
   return send({
     to: user.email,
