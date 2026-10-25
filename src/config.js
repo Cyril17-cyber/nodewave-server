@@ -80,22 +80,25 @@ if (!parsed.success) {
 }
 
 const env = parsed.data;
+const withoutTrailingSlash = (url) => url.replace(/\/+$/, "");
 
 export const config = {
   ...env,
   isProd: env.NODE_ENV === "production",
   isTest: env.NODE_ENV === "test",
-  CORS_ORIGINS: env.CORS_ORIGINS.length ? env.CORS_ORIGINS : [env.CLIENTURL],
+  // Browsers send origins without a trailing slash, and email links append paths to CLIENTURL
+  CLIENTURL: withoutTrailingSlash(env.CLIENTURL),
+  CORS_ORIGINS: (env.CORS_ORIGINS.length ? env.CORS_ORIGINS : [env.CLIENTURL]).map(withoutTrailingSlash),
   GOOGLE_CLIENT_IDS: env.GOOGLE_CLIENT_IDS.length
     ? env.GOOGLE_CLIENT_IDS
     : [env.GOOGLECLIENTID].filter(Boolean),
   SIWE_DOMAINS: env.SIWE_DOMAINS.length ? env.SIWE_DOMAINS : [new URL(env.CLIENTURL).host],
   CONTRACT_ADDRESS: env.CONTRACT_ADDRESS?.toLowerCase(),
-  API_PUBLIC_URL: (env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`).replace(/\/$/, ""),
+  API_PUBLIC_URL: withoutTrailingSlash(env.API_PUBLIC_URL ?? `http://localhost:${env.PORT}`),
   STORAGE_DIR: path.resolve(env.STORAGE_DIR),
   // Env vars can't hold newlines everywhere, so accept "\n" in the PEM too
   DATABASE_SSL_CA: env.DATABASE_SSL_CA?.replace(/\\n/g, "\n"),
-  SUPABASE_URL: env.SUPABASE_URL?.replace(/\/$/, ""),
+  SUPABASE_URL: env.SUPABASE_URL && withoutTrailingSlash(env.SUPABASE_URL),
   supabaseStorageEnabled: Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY),
   pinataEnabled: Boolean(env.PINATA_JWT && env.PINATA_GATEWAY),
   chainEnabled: Boolean(env.RPC_URL && env.CONTRACT_ADDRESS),
